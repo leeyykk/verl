@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -38,6 +39,7 @@ from transfer_queue import KVBatchMeta
 
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.agent_loop import AgentLoopManager
+from verl.experimental.mopd_systems.timeline import emit_timeline_event
 from verl.experimental.reward_loop import RewardLoopManager
 from verl.experimental.teacher_loop import MultiTeacherModelManager
 from verl.protocol import DataProto, DataProtoFuture
@@ -756,11 +758,18 @@ class PPOTrainer(ABC):
             self.role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)
             self.mapping[Role.Critic] = "global_pool"
 
-        # Global resource pool is used for actor, rollout, critic, ref
+        # Global resource pool is used for actor, rollout, critic, ref.
+        # Branch-local MOPD systems probes can also colocate teacher servers on
+        # this same pool so one physical 8 GPU node can time-share student and
+        # routed teachers, matching the Open-MOPD systems style.
         global_pool_id = "global_pool"
         resource_pool_spec = {
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
         }
+        colocate_teachers = bool(
+            OmegaConf.select(config, "mopd_systems.colocate_teachers_with_actor_rollout", default=False)
+        )
+        max_colocate_count = int(OmegaConf.select(config, "mopd_systems.max_colocate_count", default=3))
 
         # Add separate resource pool for reward model if enabled
         if config.reward.reward_model.enable_resource_pool:
@@ -784,11 +793,28 @@ class PPOTrainer(ABC):
             if distillation_config.nnodes <= 0:
                 raise ValueError("config.distillation.nnodes must be greater than 0")
 
-            teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
-            resource_pool_spec["teacher_pool"] = teacher_pool
-            self.mapping[Role.TeacherModel] = "teacher_pool"
+            if colocate_teachers:
+                if distillation_config.nnodes != config.trainer.nnodes:
+                    raise ValueError(
+                        "mopd_systems.colocate_teachers_with_actor_rollout=True requires "
+                        "distillation.nnodes == trainer.nnodes"
+                    )
+                if distillation_config.n_gpus_per_node != config.trainer.n_gpus_per_node:
+                    raise ValueError(
+                        "mopd_systems.colocate_teachers_with_actor_rollout=True requires "
+                        "distillation.n_gpus_per_node == trainer.n_gpus_per_node"
+                    )
+                self.mapping[Role.TeacherModel] = global_pool_id
+            else:
+                teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
+                resource_pool_spec["teacher_pool"] = teacher_pool
+                self.mapping[Role.TeacherModel] = "teacher_pool"
 
-        self.resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
+        self.resource_pool_manager = ResourcePoolManager(
+            resource_pool_spec=resource_pool_spec,
+            mapping=self.mapping,
+            max_colocate_count=max_colocate_count,
+        )
 
     def _load_checkpoint(self):
         self.global_steps = 0
@@ -1733,6 +1759,13 @@ class PPOTrainer(ABC):
 
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the actor network."""
+        emit_timeline_event(
+            "student_train_start",
+            step=getattr(self, "global_steps", None),
+            batch_size=len(batch.keys),
+            trainer_mode=self.config.trainer.v1.trainer_mode,
+        )
+        train_start = time.perf_counter()
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
@@ -1769,6 +1802,13 @@ class PPOTrainer(ABC):
         output["perf/mfu/actor"] = output.pop("actor/mfu")
         actor_metrics = reduce_metrics(output)
         metrics.update(actor_metrics)
+        emit_timeline_event(
+            "student_train_end",
+            step=getattr(self, "global_steps", None),
+            batch_size=len(batch.keys),
+            trainer_mode=self.config.trainer.v1.trainer_mode,
+            duration_s=round(time.perf_counter() - train_start, 6),
+        )
 
         return batch
 

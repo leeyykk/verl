@@ -190,10 +190,16 @@ class MultiTeacherModelManager:
 
     def _initialize_teacher_model_managers(self):
         teacher_models = self.distillation_config.teacher_models
-        split_sizes = [teacher.world_size for teacher in teacher_models.values()]
-        split_pools = split_resource_pool(self.resource_pool, split_size=split_sizes)
+        reuse_full_pool = bool(
+            OmegaConf.select(self.config, "mopd_systems.reuse_full_pool_per_teacher", default=False)
+        )
+        if reuse_full_pool:
+            teacher_pools = [self.resource_pool for _ in teacher_models]
+        else:
+            split_sizes = [teacher.world_size for teacher in teacher_models.values()]
+            teacher_pools = split_resource_pool(self.resource_pool, split_size=split_sizes)
 
-        for (key, teacher_model_config), teacher_pool in zip(teacher_models.items(), split_pools, strict=True):
+        for (key, teacher_model_config), teacher_pool in zip(teacher_models.items(), teacher_pools, strict=True):
             manager = TeacherModelManager(
                 distillation_config=self.distillation_config,
                 teacher_model_config=teacher_model_config,

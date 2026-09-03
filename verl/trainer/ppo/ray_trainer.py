@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -34,6 +35,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
+from verl.experimental.mopd_systems.timeline import emit_timeline_event
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -1325,6 +1327,14 @@ class RayPPOTrainer:
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
+        emit_timeline_event(
+            "student_train_start",
+            step=getattr(self, "global_steps", None),
+            batch_size=len(batch),
+            has_teacher_topk="teacher_ids" in batch.batch.keys() and "teacher_logprobs" in batch.batch.keys(),
+            has_old_log_probs="old_log_probs" in batch.batch.keys(),
+        )
+        train_start = time.perf_counter()
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
@@ -1372,6 +1382,12 @@ class RayPPOTrainer:
         # modify key name
         actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
         actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
+        emit_timeline_event(
+            "student_train_end",
+            step=getattr(self, "global_steps", None),
+            batch_size=len(batch),
+            duration_s=round(time.perf_counter() - train_start, 6),
+        )
 
         return actor_output
 

@@ -147,6 +147,7 @@ def get_ppo_ray_runtime_env(config=None):
         "FLASH_ATTENTION_DETERMINISTIC",
         "NCCL_DETERMINISTIC",
         "NCCL_ALGO",
+        "VERL_MOPD_TIMELINE_JSONL",
     ):
         val = os.environ.get(key)
         if val is not None:

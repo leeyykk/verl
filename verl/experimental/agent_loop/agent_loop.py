@@ -31,6 +31,7 @@ import asyncio
 import logging
 import os
 import random
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
@@ -46,6 +47,7 @@ from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
 from verl.experimental.agent_loop.utils import resolve_config_path
+from verl.experimental.mopd_systems.timeline import emit_timeline_event
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
 from verl.trainer.distillation import is_distillation_enabled
@@ -661,7 +663,32 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
+            emit_timeline_event(
+                "student_rollout_start",
+                step=trajectory["step"],
+                sample_index=trajectory["sample_index"],
+                rollout_n=trajectory["rollout_n"],
+                validate=trajectory["validate"],
+                agent_name=agent_name,
+                domain=kwargs.get("domain"),
+                data_source=kwargs.get("data_source"),
+            )
+            rollout_start = time.perf_counter()
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            emit_timeline_event(
+                "student_rollout_end",
+                step=trajectory["step"],
+                sample_index=trajectory["sample_index"],
+                rollout_n=trajectory["rollout_n"],
+                validate=trajectory["validate"],
+                agent_name=agent_name,
+                domain=kwargs.get("domain"),
+                data_source=kwargs.get("data_source"),
+                duration_s=round(time.perf_counter() - rollout_start, 6),
+                prompt_tokens=len(output.prompt_ids),
+                response_tokens=len(output.response_ids),
+                response_mask_tokens=int(sum(output.response_mask)),
+            )
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(
@@ -1014,11 +1041,28 @@ class AgentLoopWorker:
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+            emit_timeline_event(
+                "teacher_topk_start",
+                routing_key=routing_key,
+                prompt_tokens=len(prompt_ids),
+                response_tokens=len(response_ids),
+                topk=self.distillation_config.distillation_loss.topk,
+                loss_mode=self.distillation_config.distillation_loss.loss_mode,
+            )
+            teacher_start = time.perf_counter()
             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 routing_key=routing_key,
+            )
+            emit_timeline_event(
+                "teacher_topk_end",
+                routing_key=routing_key,
+                duration_s=round(time.perf_counter() - teacher_start, 6),
+                sequence_tokens=len(prompt_ids) + len(response_ids),
+                teacher_ids_shape=list(teacher_ids.shape),
+                teacher_logprobs_shape=list(teacher_logprobs.shape),
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
